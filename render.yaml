@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: algoalpha-trader
+    runtime: node
+    plan: free
+    branch: main
+    autoDeploy: false
+    buildCommand: ""
+    startCommand: "node trader-shell.js"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

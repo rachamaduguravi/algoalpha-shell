@@ -1,0 +1,12 @@
+{
+  "name": "algoalpha-shell",
+  "version": "1.0.0",
+  "description": "Algo Alpha - Lightweight Standby Cloud Container Receiver Shell",
+  "main": "trader-shell.js",
+  "scripts": {
+    "start": "node trader-shell.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
