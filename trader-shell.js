@@ -36,12 +36,25 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
+  function getAppHandler() {
+    if (!activeApp) return null;
+    if (typeof activeApp.handle === 'function') return (req, res) => activeApp.handle(req, res);
+    if (typeof activeApp === 'function') return activeApp;
+    if (activeApp.app && typeof activeApp.app.handle === 'function') return (req, res) => activeApp.app.handle(req, res);
+    if (activeApp.default && typeof activeApp.default.handle === 'function') return (req, res) => activeApp.default.handle(req, res);
+    return null;
+  }
+
   // 1. Health Probe
   if (req.url === '/api/health') {
+    const handler = getAppHandler();
+    if (handler) {
+      return handler(req, res);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       status: 'OK',
-      mode: activeApp ? 'ACTIVE_BUNDLE' : 'STANDBY_SHELL',
+      mode: 'STANDBY_SHELL',
       uptime: Math.round(process.uptime()),
       timestamp: Date.now()
     }));
@@ -49,11 +62,15 @@ const server = http.createServer((req, res) => {
 
   // 2. Version Probe
   if (req.url === '/api/version') {
+    const handler = getAppHandler();
+    if (handler) {
+      return handler(req, res);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       version: '1.0.0',
       build: 'shell',
-      mode: activeApp ? 'ACTIVE' : 'STANDBY'
+      mode: 'STANDBY'
     }));
   }
 
@@ -92,12 +109,20 @@ const server = http.createServer((req, res) => {
   }
 
   // 5. Delegate all other HTTP requests to the active application
-  if (activeApp && typeof activeApp.handle === 'function') {
-    return activeApp.handle(req, res);
+  const appHandler = getAppHandler();
+  if (appHandler) {
+    return appHandler(req, res);
   }
 
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Algo Alpha Standby Shell is active. Ready for bundle injection via /env/inject-bundle.\n');
+});
+
+server.on('upgrade', (req, socket, head) => {
+  if (activeApp && typeof activeApp.handleUpgrade === 'function') {
+    return activeApp.handleUpgrade(req, socket, head);
+  }
+  socket.destroy();
 });
 
 server.listen(PORT, '0.0.0.0', () => {

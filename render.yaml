@@ -1,11 +1,11 @@
 services:
   - type: web
-    name: algoalpha-trader
+    name: algoalphatrader01
     runtime: node
     plan: free
     branch: main
     autoDeploy: false
-    buildCommand: ""
+    buildCommand: "echo \"no build\""
     startCommand: "node trader-shell.js"
     envVars:
       - key: NODE_ENV
