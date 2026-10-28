@@ -10,20 +10,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = parseInt(process.env.PORT, 10) || 10000;
+const PORT = parseInt(process.env.PORT, 10) || 8090;
 const BUNDLE_FILE = path.join(__dirname, 'active_trader.js');
 
 let activeApp = null;
-
-// Auto-restore bundle from disk if previously saved
-if (fs.existsSync(BUNDLE_FILE)) {
-  try {
-    activeApp = require(BUNDLE_FILE);
-    console.log('[SHELL] Restored active bundle from disk (' + BUNDLE_FILE + ').');
-  } catch (err) {
-    console.error('[SHELL] Error booting saved bundle:', err.message);
-  }
-}
 
 const server = http.createServer((req, res) => {
   // CORS Headers
@@ -36,6 +26,9 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
+  const urlObj = new URL(req.url, 'http://' + (req.headers.host || '127.0.0.1'));
+  const pathname = urlObj.pathname;
+
   function getAppHandler() {
     if (!activeApp) return null;
     if (typeof activeApp.handle === 'function') return (req, res) => activeApp.handle(req, res);
@@ -46,7 +39,7 @@ const server = http.createServer((req, res) => {
   }
 
   // 1. Health Probe
-  if (req.url === '/api/health') {
+  if (pathname === '/api/health') {
     const handler = getAppHandler();
     if (handler) {
       return handler(req, res);
@@ -61,7 +54,7 @@ const server = http.createServer((req, res) => {
   }
 
   // 2. Version Probe
-  if (req.url === '/api/version') {
+  if (pathname === '/api/version') {
     const handler = getAppHandler();
     if (handler) {
       return handler(req, res);
@@ -75,7 +68,7 @@ const server = http.createServer((req, res) => {
   }
 
   // 3. Reset to Standby Shell
-  if ((req.url === '/env/restart-shell' || req.url === '/api/system/reset-shell') && req.method === 'POST') {
+  if ((pathname === '/env/restart-shell' || pathname === '/api/system/reset-shell') && req.method === 'POST') {
     activeApp = null;
     if (fs.existsSync(BUNDLE_FILE)) {
       try { fs.unlinkSync(BUNDLE_FILE); } catch (_) {}
@@ -84,17 +77,46 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ ok: true, status: 'STANDBY_SHELL' }));
   }
 
-  // 4. REST Bundle Injection
-  if ((req.url === '/env/inject-bundle' || req.url === '/api/system/inject-bundle') && req.method === 'POST') {
+  // 4. REST Bundle Injection & Deployment
+  if ((pathname === '/env/inject-bundle' || pathname === '/api/system/inject-bundle' || pathname === '/api/system/deploy-bundle') && req.method === 'POST') {
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
       try {
-        const bundleBuffer = Buffer.concat(chunks);
+        let bundleBuffer = Buffer.concat(chunks);
+        const cType = req.headers['content-type'] || '';
+        if (cType.includes('application/json')) {
+          try {
+            const parsed = JSON.parse(bundleBuffer.toString('utf8'));
+            if (parsed.bundle || parsed.code || parsed.data) {
+              bundleBuffer = Buffer.from(parsed.bundle || parsed.code || parsed.data, 'utf8');
+            } else if (parsed.filename || pathname.includes('deploy-bundle')) {
+              const candidatePaths = [
+                path.resolve(process.env.REPO_ROOT || '', 'dist/trader.js'),
+                path.resolve(__dirname, '../../pwa-trader/dist/trader.js'),
+                path.resolve(__dirname, '../pwa-trader/dist/trader.js'),
+                path.resolve(__dirname, 'active_trader.js')
+              ];
+              const found = candidatePaths.find(p => p && fs.existsSync(p));
+              if (found) bundleBuffer = fs.readFileSync(found);
+            }
+          } catch (_) {}
+        }
+
         fs.writeFileSync(BUNDLE_FILE, bundleBuffer);
 
         delete require.cache[require.resolve(BUNDLE_FILE)];
         activeApp = require(BUNDLE_FILE);
+
+        // Ensure live broker mode (HYBRID) is enforced on bundle injection
+        try {
+          if (global.__marketDataGateway && typeof global.__marketDataGateway.setMode === 'function') {
+            global.__marketDataGateway.setMode('HYBRID');
+          }
+          if (global.__syntheticMarketFeedEngine && global.__syntheticMarketFeedEngine.isRunning) {
+            global.__syntheticMarketFeedEngine.stop();
+          }
+        } catch (_) {}
 
         console.log('[SHELL] New bundle injected successfully (' + bundleBuffer.length + ' bytes).');
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -125,6 +147,36 @@ server.on('upgrade', (req, socket, head) => {
   socket.destroy();
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+let retryCount = 0;
+function onListening() {
   console.log('[SHELL] Standby receiver listening on port ' + PORT);
+
+  // Auto-restore bundle from disk AFTER shell port is bound
+  if (fs.existsSync(BUNDLE_FILE)) {
+    try {
+      activeApp = require(BUNDLE_FILE);
+      console.log('[SHELL] Restored active bundle from disk (' + BUNDLE_FILE + ').');
+    } catch (err) {
+      console.error('[SHELL] Error booting saved bundle:', err.message);
+    }
+  }
+}
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    if (retryCount < 10) {
+      retryCount++;
+      console.log('[SHELL] Port ' + PORT + ' busy (TIME_WAIT). Retrying bind in 1s (' + retryCount + '/10)...');
+      setTimeout(() => {
+        try { server.close(); } catch (_) {}
+        server.listen(PORT, '0.0.0.0', onListening);
+      }, 1000);
+      return;
+    }
+    console.error('[SHELL ERROR] Port ' + PORT + ' is already in use by another process.');
+  } else {
+    console.error('[SHELL ERROR]', err.message);
+  }
 });
+
+server.listen(PORT, '0.0.0.0', onListening);

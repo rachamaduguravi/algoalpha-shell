@@ -12,3 +12,5 @@ services:
         value: production
       - key: PORT
         value: 10000
+      - key: DATA_DIR
+        value: /tmpx
