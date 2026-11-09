@@ -5,8 +5,9 @@
  * Multiplexed zero-build cloud receiver for Render Cloud:
  * 1. Trader Subsystem  (active_trader.mjs)  -> UI, Positions, Orders, Broker WS
  * 2. Scraper Subsystem (active_scraper.mjs) -> TV WS, Multi-TF, SQLite, Parquet
- * 3. Management API    (/env/inject-bundle, /env/inject-scraper, /env/restart-shell)
- * 4. Mutual 5-Minute Anti-Sleep Keep-Alive Loop
+ * 3. Management API    (/env/inject-bundle, /env/inject-scraper, /env/inject-csv, /env/restart-shell)
+ * 4. Scrape Lifecycle  (/api/scrape/start, /api/scrape/stop, /api/scrape/status)
+ * 5. Mutual 5-Minute Anti-Sleep Keep-Alive Loop
  */
 
 import http from 'node:http';
@@ -28,6 +29,8 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 let activeTrader = null;
 let activeScraper = false;
+let currentScraperProcess = null;
+
 let activeJob = {
   isRunning: false,
   preset: null,
@@ -127,7 +130,8 @@ const server = http.createServer(async (req, res) => {
       scraper: {
         active: fs.existsSync(SCRAPER_BUNDLE) || activeScraper,
         filesCount: files.length,
-        isScraping: activeJob.isRunning
+        isScraping: activeJob.isRunning,
+        pid: currentScraperProcess ? currentScraperProcess.pid : null
       },
       storageDir: DATA_DIR,
       files,
@@ -144,11 +148,12 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/version') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
-      version: '2.0.0',
+      version: '2.1.0',
       build: 'dual-shell-esm',
       mode: 'DUAL_STANDBY_SHELL',
       traderActive: !!activeTrader,
-      scraperActive: fs.existsSync(SCRAPER_BUNDLE) || activeScraper
+      scraperActive: fs.existsSync(SCRAPER_BUNDLE) || activeScraper,
+      isScraping: activeJob.isRunning
     }));
   }
 
@@ -162,7 +167,12 @@ const server = http.createServer(async (req, res) => {
       if (fs.existsSync(TRADER_BUNDLE)) try { fs.unlinkSync(TRADER_BUNDLE); } catch (_) {}
     }
     if (target === 'scraper' || target === 'all') {
+      if (currentScraperProcess) {
+        try { currentScraperProcess.kill('SIGTERM'); } catch (_) {}
+        currentScraperProcess = null;
+      }
       activeScraper = false;
+      activeJob.isRunning = false;
       if (fs.existsSync(SCRAPER_BUNDLE)) try { fs.unlinkSync(SCRAPER_BUNDLE); } catch (_) {}
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -245,7 +255,174 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --------------------------------------------------------------------------
-  // 6. Scraper Subsystem REST API (/api/files, /api/download, /api/scrape, /api/parquet)
+  // 6. Live CSV Watchlist Injection (/env/inject-csv, /api/upload-csv)
+  // --------------------------------------------------------------------------
+  if ((pathname === '/env/inject-csv' || pathname === '/api/upload-csv' || pathname === '/api/system/inject-csv') && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        let contentBuffer = Buffer.concat(chunks);
+        let filename = urlObj.searchParams.get('filename') || 'watchlist.csv';
+
+        const cType = req.headers['content-type'] || '';
+        if (cType.includes('application/json')) {
+          try {
+            const parsed = JSON.parse(contentBuffer.toString('utf8'));
+            if (parsed.filename) filename = parsed.filename;
+            if (parsed.content || parsed.data || parsed.csv) {
+              contentBuffer = Buffer.from(parsed.content || parsed.data || parsed.csv, 'utf8');
+            }
+          } catch (_) {}
+        }
+
+        const safeFilename = path.basename(filename);
+        const rootPath = path.join(__dirname, safeFilename);
+        const dataPath = path.join(DATA_DIR, safeFilename);
+
+        fs.writeFileSync(rootPath, contentBuffer);
+        try { fs.writeFileSync(dataPath, contentBuffer); } catch (_) {}
+
+        console.log(`[DUAL-SHELL] CSV injected successfully: ${safeFilename} (${contentBuffer.length} bytes).`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          filename: safeFilename,
+          sizeBytes: contentBuffer.length,
+          savedTo: [rootPath, dataPath]
+        }));
+      } catch (err) {
+        console.error('[DUAL-SHELL] CSV injection error:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // 7. Scraper Status Inspection (/api/scrape/status)
+  // --------------------------------------------------------------------------
+  if ((pathname === '/api/scrape/status' || pathname === '/api/system/scrape/status') && req.method === 'GET') {
+    const uptime = activeJob.startedAt ? Math.round((Date.now() - new Date(activeJob.startedAt).getTime()) / 1000) : 0;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      isRunning: activeJob.isRunning,
+      pid: currentScraperProcess ? currentScraperProcess.pid : null,
+      preset: activeJob.preset,
+      startedAt: activeJob.startedAt,
+      completedAt: activeJob.completedAt,
+      durationSec: activeJob.isRunning ? uptime : null,
+      lastError: activeJob.lastError,
+      lastLogs: activeJob.outputLog.slice(-20)
+    }, null, 2));
+  }
+
+  // --------------------------------------------------------------------------
+  // 8. Stop Scraping (/api/scrape/stop)
+  // --------------------------------------------------------------------------
+  if ((pathname === '/api/scrape/stop' || pathname === '/api/system/scrape/stop') && (req.method === 'POST' || req.method === 'GET')) {
+    if (!currentScraperProcess || !activeJob.isRunning) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, message: 'No scrape process is currently running.', isRunning: false }));
+    }
+
+    console.log(`[DUAL-SHELL] Stopping scrape process (PID ${currentScraperProcess.pid})...`);
+    try {
+      currentScraperProcess.kill('SIGTERM');
+      const killedPid = currentScraperProcess.pid;
+      setTimeout(() => {
+        if (currentScraperProcess && currentScraperProcess.pid === killedPid) {
+          try { currentScraperProcess.kill('SIGKILL'); } catch (_) {}
+        }
+      }, 3000);
+    } catch (e) {
+      console.error('[DUAL-SHELL] Error terminating scraper:', e.message);
+    }
+
+    activeJob.isRunning = false;
+    activeJob.completedAt = new Date().toISOString();
+    activeJob.lastError = 'Terminated by user via /api/scrape/stop';
+    currentScraperProcess = null;
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, message: 'Scrape process stopped.', status: 'STOPPED' }));
+  }
+
+  // --------------------------------------------------------------------------
+  // 9. Start Scraping (/api/scrape, /api/scrape/start)
+  // --------------------------------------------------------------------------
+  if ((pathname === '/api/scrape' || pathname === '/api/scrape/start' || pathname === '/api/system/scrape') && (req.method === 'POST' || req.method === 'GET')) {
+    if (activeJob.isRunning && currentScraperProcess) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        error: 'Scrape pipeline is already actively running.',
+        pid: currentScraperProcess.pid,
+        jobState: activeJob
+      }));
+    }
+
+    if (!fs.existsSync(SCRAPER_BUNDLE)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Scraper bundle not found. Deploy scraper bundle first via /env/inject-scraper.' }));
+    }
+
+    const preset = urlObj.searchParams.get('preset') || 'PK.csv';
+    activeJob = {
+      isRunning: true,
+      preset,
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      lastError: null,
+      outputLog: []
+    };
+
+    console.log(`[DUAL-SHELL] Triggering background scrape for preset ${preset}...`);
+
+    currentScraperProcess = spawn(process.execPath, [SCRAPER_BUNDLE, '-c', preset], {
+      cwd: path.dirname(SCRAPER_BUNDLE),
+      stdio: 'pipe'
+    });
+
+    const activePid = currentScraperProcess.pid;
+
+    currentScraperProcess.stdout.on('data', (d) => {
+      const line = d.toString().trim();
+      if (line) {
+        console.log(`[SCRAPER] ${line}`);
+        activeJob.outputLog.push(line);
+        if (activeJob.outputLog.length > 100) activeJob.outputLog.shift();
+      }
+    });
+
+    currentScraperProcess.stderr.on('data', (d) => {
+      const line = d.toString().trim();
+      if (line) {
+        console.error(`[SCRAPER ERROR] ${line}`);
+        activeJob.lastError = line;
+      }
+    });
+
+    currentScraperProcess.on('close', (code) => {
+      if (currentScraperProcess && currentScraperProcess.pid === activePid) {
+        currentScraperProcess = null;
+      }
+      activeJob.isRunning = false;
+      activeJob.completedAt = new Date().toISOString();
+      console.log(`[DUAL-SHELL] Scrape child process exited with code ${code}`);
+    });
+
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      message: 'Scrape job launched asynchronously on Render container.',
+      pid: activePid,
+      preset,
+      status: 'RUNNING'
+    }));
+  }
+
+  // --------------------------------------------------------------------------
+  // 10. Scraper File Listings & Downloads (/api/files, /api/download/:file)
   // --------------------------------------------------------------------------
   if (pathname === '/api/files' && req.method === 'GET') {
     if (!fs.existsSync(DATA_DIR)) {
@@ -286,65 +463,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if ((pathname === '/api/scrape' || pathname === '/api/system/scrape') && (req.method === 'POST' || req.method === 'GET')) {
-    if (activeJob.isRunning) {
-      res.writeHead(409, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Scrape pipeline is already actively running.', jobState: activeJob }));
-    }
-
-    if (!fs.existsSync(SCRAPER_BUNDLE)) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Scraper bundle not found. Deploy scraper bundle first via /env/inject-scraper.' }));
-    }
-
-    const preset = urlObj.searchParams.get('preset') || 'PK.csv';
-    activeJob = {
-      isRunning: true,
-      preset,
-      startedAt: new Date().toISOString(),
-      completedAt: null,
-      lastError: null,
-      outputLog: []
-    };
-
-    console.log(`[DUAL-SHELL] Triggering background scrape for preset ${preset}...`);
-
-    const scraperChild = spawn(process.execPath, [SCRAPER_BUNDLE, '-c', preset], {
-      cwd: path.dirname(SCRAPER_BUNDLE),
-      stdio: 'pipe'
-    });
-
-    scraperChild.stdout.on('data', (d) => {
-      const line = d.toString().trim();
-      if (line) {
-        console.log(`[SCRAPER] ${line}`);
-        activeJob.outputLog.push(line);
-        if (activeJob.outputLog.length > 50) activeJob.outputLog.shift();
-      }
-    });
-
-    scraperChild.stderr.on('data', (d) => {
-      const line = d.toString().trim();
-      if (line) {
-        console.error(`[SCRAPER ERROR] ${line}`);
-        activeJob.lastError = line;
-      }
-    });
-
-    scraperChild.on('close', (code) => {
-      activeJob.isRunning = false;
-      activeJob.completedAt = new Date().toISOString();
-      console.log(`[DUAL-SHELL] Scrape child process exited with code ${code}`);
-    });
-
-    res.writeHead(202, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      message: 'Scrape job launched asynchronously on Render container.',
-      preset,
-      status: 'RUNNING'
-    }));
-  }
-
+  // --------------------------------------------------------------------------
+  // 11. Parquet Conversion (/api/parquet)
+  // --------------------------------------------------------------------------
   if ((pathname === '/api/parquet' || pathname === '/api/system/parquet') && (req.method === 'POST' || req.method === 'GET')) {
     if (!fs.existsSync(SCRAPER_BUNDLE)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -370,7 +491,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --------------------------------------------------------------------------
-  // 7. Delegate all other HTTP requests to Active Trader Subsystem
+  // 12. Delegate all other HTTP requests to Active Trader Subsystem
   // --------------------------------------------------------------------------
   const appHandler = getTraderHandler();
   if (appHandler) {
@@ -385,9 +506,12 @@ const server = http.createServer(async (req, res) => {
     '  - GET  /api/health           Unified Health & Telemetry\n' +
     '  - POST /env/inject-bundle    Inject Trader Bundle (active_trader.mjs)\n' +
     '  - POST /env/inject-scraper   Inject Scraper Bundle (active_scraper.mjs)\n' +
+    '  - POST /env/inject-csv       Inject Watchlist CSV (?filename=PK.csv)\n' +
+    '  - POST /api/scrape/start     Start Candle Scrape (?preset=PK.csv)\n' +
+    '  - POST /api/scrape/stop      Stop Active Candle Scrape\n' +
+    '  - GET  /api/scrape/status    Real-time Scrape Status & Tail Logs\n' +
     '  - GET  /api/files            List Parquet & SQLite Archives\n' +
     '  - GET  /api/download/:file   Download Archive\n' +
-    '  - POST /api/scrape           Trigger Multi-TF Candle Scrape (?preset=PK.csv)\n' +
     '  - POST /api/parquet          Convert SQLite to ZSTD Parquet (?date=YYYY-MM-DD)\n' +
     '  - POST /env/restart-shell    Reset Subsystems (?target=trader|scraper|all)\n');
 });
