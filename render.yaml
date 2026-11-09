@@ -3,14 +3,18 @@ services:
     name: algoalphatrader01
     runtime: node
     plan: free
+    region: singapore
     branch: main
     autoDeploy: false
-    buildCommand: "echo \"no build\""
-    startCommand: "node trader-shell.js"
+    buildCommand: "npm install"
+    startCommand: "node trader-shell.mjs"
+    healthCheckPath: /healthz
     envVars:
-      - key: NODE_ENV
-        value: production
+      - key: NODE_VERSION
+        value: 22.11.0
       - key: PORT
         value: 10000
       - key: DATA_DIR
-        value: /tmpx
+        value: ./scrape
+      - key: KEEP_ALIVE
+        value: "true"

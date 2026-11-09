@@ -1,3 +1,6 @@
+active_trader.mjs
 active_trader.js
+active_scraper.mjs
+scrape/
 node_modules/
 .env

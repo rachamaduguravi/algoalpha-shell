@@ -1,12 +1,16 @@
 {
   "name": "algoalpha-shell",
-  "version": "1.0.0",
-  "description": "Algo Alpha - Lightweight Standby Cloud Container Receiver Shell",
-  "main": "trader-shell.js",
+  "version": "1.1.0",
+  "description": "Algo Alpha - Unified Dual Standby Shell Receiver (Trader & Scraper)",
+  "type": "module",
+  "main": "trader-shell.mjs",
   "scripts": {
-    "start": "node trader-shell.js"
+    "start": "node trader-shell.mjs"
+  },
+  "dependencies": {
+    "parquetjs-lite": "^0.8.7"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.11.0"
   }
 }
