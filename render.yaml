@@ -3,11 +3,10 @@ services:
     name: algoalphatrader01
     runtime: node
     plan: free
-    region: singapore
     branch: main
     autoDeploy: false
     buildCommand: "npm install"
-    startCommand: "node trader-shell.mjs"
+    startCommand: "node alpha-shell.mjs"
     healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION

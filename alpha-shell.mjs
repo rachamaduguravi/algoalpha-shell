@@ -1,6 +1,6 @@
 /**
  * Algo Alpha - Unified Dual Standby Shell Receiver (Trader & Scraper)
- * File: trader-shell.mjs
+ * File: alpha-shell.mjs
  * 
  * Multiplexed zero-build cloud receiver for Render Cloud:
  * 1. Trader Subsystem  (active_trader.mjs)  -> UI, Positions, Orders, Broker WS
