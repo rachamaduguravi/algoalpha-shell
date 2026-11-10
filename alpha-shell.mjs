@@ -7,7 +7,7 @@
  * 2. Scraper Subsystem (active_scraper.mjs) -> TV WS, Multi-TF, SQLite, Parquet
  * 3. Management API    (/env/inject-bundle, /env/inject-scraper, /env/inject-csv, /env/restart-shell)
  * 4. Scrape Lifecycle  (/api/scrape/start, /api/scrape/stop, /api/scrape/status)
- * 5. Mutual 5-Minute Anti-Sleep Keep-Alive Loop
+ * 5. 5-Minute Self-Ping Anti-Sleep Keep-Alive Loop
  */
 
 import http from 'node:http';
@@ -90,11 +90,9 @@ async function loadReplayModule() {
 function startKeepAliveLoop() {
   const KEEP_ALIVE_INTERVAL_MS = 5 * 60 * 1000;
   const externalUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
-  const peerUrl = process.env.PEER_URL;
 
   const pingTargets = [];
   if (externalUrl) pingTargets.push(`${externalUrl.replace(/\/+$/, '')}/healthz`);
-  if (peerUrl) pingTargets.push(`${peerUrl.replace(/\/+$/, '')}/healthz`);
   pingTargets.push(`http://127.0.0.1:${PORT}/healthz`);
 
   const executePing = async () => {
