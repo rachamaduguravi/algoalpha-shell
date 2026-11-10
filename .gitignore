@@ -1,6 +1,8 @@
 active_trader.mjs
 active_trader.js
 active_scraper.mjs
+active_replay.mjs
 scrape/
+replay/
 node_modules/
 .env
