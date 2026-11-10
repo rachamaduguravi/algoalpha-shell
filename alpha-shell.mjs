@@ -374,7 +374,7 @@ const server = http.createServer(async (req, res) => {
       completedAt: activeJob.completedAt,
       durationSec: activeJob.isRunning ? uptime : null,
       lastError: activeJob.lastError,
-      lastLogs: activeJob.outputLog.slice(-20)
+      lastLogs: activeJob.outputLog
     }, null, 2));
   }
 
@@ -447,11 +447,13 @@ const server = http.createServer(async (req, res) => {
     const activePid = currentScraperProcess.pid;
 
     currentScraperProcess.stdout.on('data', (d) => {
-      const line = d.toString().trim();
-      if (line) {
-        console.log(`[SCRAPER] ${line}`);
-        activeJob.outputLog.push(line);
-        if (activeJob.outputLog.length > 100) activeJob.outputLog.shift();
+      const lines = d.toString().split(/\r?\n/);
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (line) {
+          console.log(`[SCRAPER] ${line}`);
+          activeJob.outputLog.push(line);
+        }
       }
     });
 
