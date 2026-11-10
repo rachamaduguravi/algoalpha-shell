@@ -1,244 +1,56 @@
 /**
- * Algo Alpha - Unified Dual Standby Shell Receiver (Trader & Scraper)
+ * Algo Alpha - Permanent Tiny Tri-Shell Bootstrapper (ESM)
  * File: alpha-shell.mjs
- * 
- * Multiplexed zero-build cloud receiver for Render Cloud:
- * 1. Trader Subsystem  (active_trader.mjs)  -> UI, Positions, Orders, Broker WS
- * 2. Scraper Subsystem (active_scraper.mjs) -> TV WS, Multi-TF, SQLite, Parquet
- * 3. Management API    (/env/inject-bundle, /env/inject-scraper, /env/inject-csv, /env/restart-shell)
- * 4. Scrape Lifecycle  (/api/scrape/start, /api/scrape/stop, /api/scrape/status)
- * 5. 5-Minute Self-Ping Anti-Sleep Keep-Alive Loop
+ *
+ * Minimal immutable PID-1 server shell:
+ * - Exposes POST /env/inject-shell to hot-swap active_shell_core.mjs in-memory (~0.2s)
+ * - Boots active_shell_core.mjs (or bundled shell-core.mjs) without container restarts
+ * - Runs 5-minute self-ping anti-sleep keep-alive loop
  */
 
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const PORT = parseInt(process.env.PORT, 10) || 10000;
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'scrape');
-const TRADER_BUNDLE = path.join(__dirname, 'active_trader.mjs');
-const SCRAPER_BUNDLE = path.join(__dirname, 'active_scraper.mjs');
-const REPLAY_BUNDLE = path.join(__dirname, 'active_replay.mjs');
-const REPLAY_DIR = path.join(__dirname, 'replay');
+const ACTIVE_CORE_PATH = path.join(__dirname, 'active_shell_core.mjs');
+const DEFAULT_CORE_PATH = path.join(__dirname, 'shell-core.mjs');
 
-// Ensure directories exist
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(REPLAY_DIR, { recursive: true });
+let activeCore = null;
 
-let activeTrader = null;
-let activeScraper = false;
-let activeReplay = null;
-let currentScraperProcess = null;
-
-let activeJob = {
-  isRunning: false,
-  preset: null,
-  startedAt: null,
-  completedAt: null,
-  lastError: null,
-  outputLog: []
-};
-
-// ============================================================================
-// DYNAMIC MODULE LOADERS
-// ============================================================================
-async function loadTraderModule() {
-  if (!fs.existsSync(TRADER_BUNDLE)) return null;
-  try {
-    const fileUrl = `${pathToFileURL(TRADER_BUNDLE).href}?t=${Date.now()}`;
-    const mod = await import(fileUrl);
-    activeTrader = mod.default || mod.app || mod;
-    console.log(`[DUAL-SHELL] Successfully loaded Trader bundle from: ${TRADER_BUNDLE}`);
-    return activeTrader;
-  } catch (err) {
-    console.error(`[DUAL-SHELL] Error loading Trader bundle:`, err.message);
-    return null;
-  }
+async function loadCoreModule() {
+  const target = fs.existsSync(ACTIVE_CORE_PATH) ? ACTIVE_CORE_PATH : (fs.existsSync(DEFAULT_CORE_PATH) ? DEFAULT_CORE_PATH : null);
+  if (!target) return null;
+  const mod = await import(`${pathToFileURL(target).href}?t=${Date.now()}`);
+  if (typeof mod.initShellCore === 'function') await mod.initShellCore();
+  activeCore = mod;
+  console.log(`[BOOTSTRAP] Loaded shell core: ${path.basename(target)}`);
+  return activeCore;
 }
 
-function getTraderHandler() {
-  if (!activeTrader) return null;
-  if (typeof activeTrader.handle === 'function') return (req, res) => activeTrader.handle(req, res);
-  if (typeof activeTrader === 'function') return activeTrader;
-  if (activeTrader.app && typeof activeTrader.app.handle === 'function') return (req, res) => activeTrader.app.handle(req, res);
-  if (activeTrader.default && typeof activeTrader.default.handle === 'function') return (req, res) => activeTrader.default.handle(req, res);
-  return null;
-}
-
-async function loadReplayModule() {
-  if (!fs.existsSync(REPLAY_BUNDLE)) return null;
-  try {
-    const fileUrl = `${pathToFileURL(REPLAY_BUNDLE).href}?t=${Date.now()}`;
-    const mod = await import(fileUrl);
-    activeReplay = mod;
-    console.log(`[TRI-SHELL] Successfully loaded Replay bundle from: ${REPLAY_BUNDLE}`);
-    return activeReplay;
-  } catch (err) {
-    console.error(`[TRI-SHELL] Error loading Replay bundle:`, err.message);
-    return null;
-  }
-}
-
-// ============================================================================
-// 5-MINUTE KEEP-ALIVE LOOP
-// ============================================================================
-function startKeepAliveLoop() {
-  const KEEP_ALIVE_INTERVAL_MS = 5 * 60 * 1000;
-  const externalUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
-
-  const pingTargets = [];
-  if (externalUrl) pingTargets.push(`${externalUrl.replace(/\/+$/, '')}/healthz`);
-  pingTargets.push(`http://127.0.0.1:${PORT}/healthz`);
-
-  const executePing = async () => {
-    for (const target of pingTargets) {
-      try {
-        const res = await fetch(target, { signal: AbortSignal.timeout(6000) });
-        console.log(`[KeepAlive] Pinged ${target} -> HTTP ${res.status} (Active)`);
-      } catch (err) {
-        console.log(`[KeepAlive] Ping status for ${target}: ${err.message}`);
-      }
-    }
-  };
-
-  setInterval(executePing, KEEP_ALIVE_INTERVAL_MS);
-  setTimeout(executePing, 3000);
-}
-
-// ============================================================================
-// HTTP REQUEST ROUTER
-// ============================================================================
 const server = http.createServer(async (req, res) => {
-  // Global CORS Headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    return res.end();
-  }
-
   const urlObj = new URL(req.url, 'http://' + (req.headers.host || '127.0.0.1'));
-  const pathname = urlObj.pathname;
 
-  // --------------------------------------------------------------------------
-  // 1. Unified Health & Subsystem Status (/healthz, /api/health)
-  // --------------------------------------------------------------------------
-  if (pathname === '/healthz' || pathname === '/api/health') {
-    const files = fs.existsSync(DATA_DIR)
-      ? fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.sqlite') || f.endsWith('.parquet') || f.endsWith('.csv'))
-      : [];
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      status: 'OK',
-      mode: 'TRI_STANDBY_SHELL',
-      trader: {
-        active: !!activeTrader,
-        subsystem: activeTrader ? 'HYBRID_LIVE' : 'STANDBY'
-      },
-      scraper: {
-        active: fs.existsSync(SCRAPER_BUNDLE) || activeScraper,
-        filesCount: files.length,
-        isScraping: activeJob.isRunning,
-        pid: currentScraperProcess ? currentScraperProcess.pid : null
-      },
-      replay: {
-        active: fs.existsSync(REPLAY_BUNDLE) || !!activeReplay,
-        status: activeReplay && typeof activeReplay.getReplayStatus === 'function' ? activeReplay.getReplayStatus() : { ready: !!activeReplay }
-      },
-      storageDir: DATA_DIR,
-      replayDir: REPLAY_DIR,
-      files,
-      jobState: activeJob,
-      uptime: Math.round(process.uptime()),
-      node: process.version,
-      timestamp: Date.now()
-    }, null, 2));
-  }
-
-  // --------------------------------------------------------------------------
-  // 2. Version Probe (/api/version)
-  // --------------------------------------------------------------------------
-  if (pathname === '/api/version') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      version: '3.0.0',
-      build: 'tri-shell-esm',
-      mode: 'TRI_STANDBY_SHELL',
-      traderActive: !!activeTrader,
-      scraperActive: fs.existsSync(SCRAPER_BUNDLE) || activeScraper,
-      replayActive: fs.existsSync(REPLAY_BUNDLE) || !!activeReplay,
-      isScraping: activeJob.isRunning
-    }));
-  }
-
-  // --------------------------------------------------------------------------
-  // 3. Reset Shells (/env/restart-shell, /api/system/reset-shell)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/env/restart-shell' || pathname === '/api/system/reset-shell') && req.method === 'POST') {
-    const target = urlObj.searchParams.get('target') || 'all';
-    if (target === 'trader' || target === 'all') {
-      activeTrader = null;
-      if (fs.existsSync(TRADER_BUNDLE)) try { fs.unlinkSync(TRADER_BUNDLE); } catch (_) {}
-    }
-    if (target === 'scraper' || target === 'all') {
-      if (currentScraperProcess) {
-        try { currentScraperProcess.kill('SIGTERM'); } catch (_) {}
-        currentScraperProcess = null;
-      }
-      activeScraper = false;
-      activeJob.isRunning = false;
-      if (fs.existsSync(SCRAPER_BUNDLE)) try { fs.unlinkSync(SCRAPER_BUNDLE); } catch (_) {}
-    }
-    if (target === 'replay' || target === 'all') {
-      activeReplay = null;
-      if (fs.existsSync(REPLAY_BUNDLE)) try { fs.unlinkSync(REPLAY_BUNDLE); } catch (_) {}
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, status: 'RESET', target }));
-  }
-
-  // --------------------------------------------------------------------------
-  // 4. Inject Trader Bundle (/env/inject-bundle, /env/inject-trader)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/env/inject-bundle' || pathname === '/env/inject-trader' || pathname === '/api/system/inject-bundle' || pathname === '/api/system/deploy-bundle') && req.method === 'POST') {
+  if (urlObj.pathname === '/env/inject-shell' && req.method === 'POST') {
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', async () => {
       try {
-        let bundleBuffer = Buffer.concat(chunks);
-        const cType = req.headers['content-type'] || '';
-        if (cType.includes('application/json')) {
-          try {
-            const parsed = JSON.parse(bundleBuffer.toString('utf8'));
-            if (parsed.bundle || parsed.code || parsed.data) {
-              bundleBuffer = Buffer.from(parsed.bundle || parsed.code || parsed.data, 'utf8');
-            }
-          } catch (_) {}
+        const buf = Buffer.concat(chunks);
+        const isJson = (req.headers['content-type'] || '').includes('application/json');
+        const payload = isJson ? (JSON.parse(buf.toString('utf8')).code ?? '') : buf;
+        if (!payload || payload.length < 10) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'Missing shell-core code payload' }));
         }
-
-        fs.writeFileSync(TRADER_BUNDLE, bundleBuffer);
-        await loadTraderModule();
-
-        // Enforce live broker mode (HYBRID) if gateway is available
-        try {
-          if (global.__marketDataGateway && typeof global.__marketDataGateway.setMode === 'function') {
-            global.__marketDataGateway.setMode('HYBRID');
-          }
-        } catch (_) {}
-
-        console.log(`[DUAL-SHELL] Trader bundle injected successfully (${bundleBuffer.length} bytes).`);
+        fs.writeFileSync(ACTIVE_CORE_PATH, payload);
+        await loadCoreModule();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, subsystem: 'trader', hotloadStatus: 'SUCCESS', size: bundleBuffer.length }));
+        res.end(JSON.stringify({ ok: true, subsystem: 'shell-core', hotloadStatus: 'SUCCESS', size: Buffer.byteLength(payload) }));
       } catch (err) {
-        console.error('[DUAL-SHELL] Trader injection error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: err.message }));
       }
@@ -246,404 +58,37 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // 5. Inject Scraper Bundle (/env/inject-scraper)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/env/inject-scraper' || pathname === '/api/system/inject-scraper') && req.method === 'POST') {
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-      try {
-        let scraperBuffer = Buffer.concat(chunks);
-        const cType = req.headers['content-type'] || '';
-        if (cType.includes('application/json')) {
-          try {
-            const parsed = JSON.parse(scraperBuffer.toString('utf8'));
-            if (parsed.bundle || parsed.code || parsed.data) {
-              scraperBuffer = Buffer.from(parsed.bundle || parsed.code || parsed.data, 'utf8');
-            }
-          } catch (_) {}
-        }
-
-        fs.writeFileSync(SCRAPER_BUNDLE, scraperBuffer);
-        activeScraper = true;
-
-        console.log(`[DUAL-SHELL] Scraper bundle injected successfully (${scraperBuffer.length} bytes).`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, subsystem: 'scraper', hotloadStatus: 'SUCCESS', size: scraperBuffer.length }));
-      } catch (err) {
-        console.error('[DUAL-SHELL] Scraper injection error:', err.message);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-    });
-    return;
+  if (activeCore && typeof activeCore.handleHttpRequest === 'function') {
+    return activeCore.handleHttpRequest(req, res);
   }
 
-  // --------------------------------------------------------------------------
-  // 5B. Inject Replay Bundle (/env/inject-replay)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/env/inject-replay' || pathname === '/api/system/inject-replay') && req.method === 'POST') {
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', async () => {
-      try {
-        let replayBuffer = Buffer.concat(chunks);
-        const cType = req.headers['content-type'] || '';
-        if (cType.includes('application/json')) {
-          try {
-            const parsed = JSON.parse(replayBuffer.toString('utf8'));
-            if (parsed.bundle || parsed.code || parsed.data) {
-              replayBuffer = Buffer.from(parsed.bundle || parsed.code || parsed.data, 'utf8');
-            }
-          } catch (_) {}
-        }
-
-        fs.writeFileSync(REPLAY_BUNDLE, replayBuffer);
-        await loadReplayModule();
-
-        console.log(`[TRI-SHELL] Replay bundle injected successfully (${replayBuffer.length} bytes).`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, subsystem: 'replay', hotloadStatus: 'SUCCESS', size: replayBuffer.length }));
-      } catch (err) {
-        console.error('[TRI-SHELL] Replay injection error:', err.message);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-    });
-    return;
-  }
-
-  // --------------------------------------------------------------------------
-  // 6. Live CSV Watchlist Injection (/env/inject-csv, /api/upload-csv)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/env/inject-csv' || pathname === '/api/upload-csv' || pathname === '/api/system/inject-csv') && req.method === 'POST') {
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-      try {
-        let contentBuffer = Buffer.concat(chunks);
-        let filename = urlObj.searchParams.get('filename') || 'watchlist.csv';
-
-        const cType = req.headers['content-type'] || '';
-        if (cType.includes('application/json')) {
-          try {
-            const parsed = JSON.parse(contentBuffer.toString('utf8'));
-            if (parsed.filename) filename = parsed.filename;
-            if (parsed.content || parsed.data || parsed.csv) {
-              contentBuffer = Buffer.from(parsed.content || parsed.data || parsed.csv, 'utf8');
-            }
-          } catch (_) {}
-        }
-
-        const safeFilename = path.basename(filename);
-        const rootPath = path.join(__dirname, safeFilename);
-        const dataPath = path.join(DATA_DIR, safeFilename);
-
-        fs.writeFileSync(rootPath, contentBuffer);
-        try { fs.writeFileSync(dataPath, contentBuffer); } catch (_) {}
-
-        console.log(`[DUAL-SHELL] CSV injected successfully: ${safeFilename} (${contentBuffer.length} bytes).`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          ok: true,
-          filename: safeFilename,
-          sizeBytes: contentBuffer.length,
-          savedTo: [rootPath, dataPath]
-        }));
-      } catch (err) {
-        console.error('[DUAL-SHELL] CSV injection error:', err.message);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-    });
-    return;
-  }
-
-  // --------------------------------------------------------------------------
-  // 7. Scraper Status Inspection (/api/scrape/status)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/api/scrape/status' || pathname === '/api/system/scrape/status') && req.method === 'GET') {
-    const uptime = activeJob.startedAt ? Math.round((Date.now() - new Date(activeJob.startedAt).getTime()) / 1000) : 0;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      isRunning: activeJob.isRunning,
-      pid: currentScraperProcess ? currentScraperProcess.pid : null,
-      preset: activeJob.preset,
-      startedAt: activeJob.startedAt,
-      completedAt: activeJob.completedAt,
-      durationSec: activeJob.isRunning ? uptime : null,
-      lastError: activeJob.lastError,
-      lastLogs: activeJob.outputLog
-    }, null, 2));
-  }
-
-  // --------------------------------------------------------------------------
-  // 8. Stop Scraping (/api/scrape/stop)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/api/scrape/stop' || pathname === '/api/system/scrape/stop') && (req.method === 'POST' || req.method === 'GET')) {
-    if (!currentScraperProcess || !activeJob.isRunning) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true, message: 'No scrape process is currently running.', isRunning: false }));
-    }
-
-    console.log(`[DUAL-SHELL] Stopping scrape process (PID ${currentScraperProcess.pid})...`);
-    try {
-      currentScraperProcess.kill('SIGTERM');
-      const killedPid = currentScraperProcess.pid;
-      setTimeout(() => {
-        if (currentScraperProcess && currentScraperProcess.pid === killedPid) {
-          try { currentScraperProcess.kill('SIGKILL'); } catch (_) {}
-        }
-      }, 3000);
-    } catch (e) {
-      console.error('[DUAL-SHELL] Error terminating scraper:', e.message);
-    }
-
-    activeJob.isRunning = false;
-    activeJob.completedAt = new Date().toISOString();
-    activeJob.lastError = 'Terminated by user via /api/scrape/stop';
-    currentScraperProcess = null;
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, message: 'Scrape process stopped.', status: 'STOPPED' }));
-  }
-
-  // --------------------------------------------------------------------------
-  // 9. Start Scraping (/api/scrape, /api/scrape/start)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/api/scrape' || pathname === '/api/scrape/start' || pathname === '/api/system/scrape') && (req.method === 'POST' || req.method === 'GET')) {
-    if (activeJob.isRunning && currentScraperProcess) {
-      res.writeHead(409, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
-        error: 'Scrape pipeline is already actively running.',
-        pid: currentScraperProcess.pid,
-        jobState: activeJob
-      }));
-    }
-
-    if (!fs.existsSync(SCRAPER_BUNDLE)) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Scraper bundle not found. Deploy scraper bundle first via /env/inject-scraper.' }));
-    }
-
-    const preset = urlObj.searchParams.get('preset') || 'PK.csv';
-    activeJob = {
-      isRunning: true,
-      preset,
-      startedAt: new Date().toISOString(),
-      completedAt: null,
-      lastError: null,
-      outputLog: []
-    };
-
-    console.log(`[DUAL-SHELL] Triggering background scrape for preset ${preset}...`);
-
-    currentScraperProcess = spawn(process.execPath, [SCRAPER_BUNDLE, '-c', preset], {
-      cwd: path.dirname(SCRAPER_BUNDLE),
-      stdio: 'pipe'
-    });
-
-    const activePid = currentScraperProcess.pid;
-
-    currentScraperProcess.stdout.on('data', (d) => {
-      const lines = d.toString().split(/\r?\n/);
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (line) {
-          console.log(`[SCRAPER] ${line}`);
-          activeJob.outputLog.push(line);
-        }
-      }
-    });
-
-    currentScraperProcess.stderr.on('data', (d) => {
-      const line = d.toString().trim();
-      if (line) {
-        console.error(`[SCRAPER ERROR] ${line}`);
-        activeJob.lastError = line;
-      }
-    });
-
-    currentScraperProcess.on('close', (code) => {
-      if (currentScraperProcess && currentScraperProcess.pid === activePid) {
-        currentScraperProcess = null;
-      }
-      activeJob.isRunning = false;
-      activeJob.completedAt = new Date().toISOString();
-      console.log(`[DUAL-SHELL] Scrape child process exited with code ${code}`);
-    });
-
-    res.writeHead(202, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      message: 'Scrape job launched asynchronously on Render container.',
-      pid: activePid,
-      preset,
-      status: 'RUNNING'
-    }));
-  }
-
-  // --------------------------------------------------------------------------
-  // 10. Scraper File Listings & Downloads (/api/files, /api/download/:file)
-  // --------------------------------------------------------------------------
-  if (pathname === '/api/files' && req.method === 'GET') {
-    if (!fs.existsSync(DATA_DIR)) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify([]));
-    }
-    const files = fs.readdirSync(DATA_DIR)
-      .filter(f => f.endsWith('.sqlite') || f.endsWith('.parquet') || f.endsWith('.csv'))
-      .map(f => {
-        const st = fs.statSync(path.join(DATA_DIR, f));
-        return {
-          filename: f,
-          type: path.extname(f).slice(1).toUpperCase(),
-          sizeBytes: st.size,
-          sizeMb: (st.size / 1024 / 1024).toFixed(2),
-          modified: st.mtime.toISOString(),
-          downloadUrl: '/api/download/' + f
-        };
-      });
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(files, null, 2));
-  }
-
-  if (pathname.startsWith('/api/download/') && req.method === 'GET') {
-    const filename = path.basename(pathname.replace('/api/download/', ''));
-    const filePath = path.join(DATA_DIR, filename);
-    if (!fs.existsSync(filePath)) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'File not found: ' + filename }));
-    }
-    const stat = fs.statSync(filePath);
-    res.writeHead(200, {
-      'Content-Type': filename.endsWith('.parquet') ? 'application/octet-stream' : filename.endsWith('.csv') ? 'text/csv' : 'application/x-sqlite3',
-      'Content-Length': stat.size,
-      'Content-Disposition': 'attachment; filename="' + filename + '"'
-    });
-    fs.createReadStream(filePath).pipe(res);
-    return;
-  }
-
-  // --------------------------------------------------------------------------
-  // 11. Parquet Conversion (/api/parquet)
-  // --------------------------------------------------------------------------
-  if ((pathname === '/api/parquet' || pathname === '/api/system/parquet') && (req.method === 'POST' || req.method === 'GET')) {
-    if (!fs.existsSync(SCRAPER_BUNDLE)) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Scraper bundle not found.' }));
-    }
-
-    const dateParam = urlObj.searchParams.get('date');
-    const args = [SCRAPER_BUNDLE, '-p'];
-    if (dateParam) args.push(dateParam);
-
-    console.log(`[DUAL-SHELL] Launching Parquet conversion for: ${dateParam || 'all'}`);
-    const parquetChild = spawn(process.execPath, args, {
-      cwd: path.dirname(SCRAPER_BUNDLE),
-      stdio: 'inherit'
-    });
-
-    parquetChild.on('close', (code) => {
-      console.log(`[DUAL-SHELL] Parquet conversion finished with code ${code}`);
-    });
-
-    res.writeHead(202, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ message: 'Parquet conversion launched.', date: dateParam || 'all' }));
-  }
-
-  // --------------------------------------------------------------------------
-  // 11B. Replay API Requests (/api/replay/*)
-  // --------------------------------------------------------------------------
-  if (pathname.startsWith('/api/replay')) {
-    if (activeReplay && typeof activeReplay.handleReplayRequest === 'function') {
-      try {
-        const queryParams = Object.fromEntries(urlObj.searchParams.entries());
-        const handled = activeReplay.handleReplayRequest(req, res, pathname, queryParams);
-        if (handled) return;
-      } catch (replayErr) {
-        console.error('[TRI-SHELL] Error delegating to Replay handler:', replayErr.message);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ ok: false, error: replayErr.message }));
-      }
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // 12. Delegate all other HTTP requests to Active Trader Subsystem
-  // --------------------------------------------------------------------------
-  const appHandler = getTraderHandler();
-  if (appHandler) {
-    return appHandler(req, res);
-  }
-
-  // Standby Fallback Landing Page
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Algo Alpha Unified Tri Standby Shell (ESM) is active.\n\n' +
-    'Coexisting Endpoints:\n' +
-    '  - GET  /healthz              Unified Health & Telemetry\n' +
-    '  - GET  /api/health           Unified Health & Telemetry\n' +
-    '  - POST /env/inject-bundle    Inject Trader Bundle (active_trader.mjs)\n' +
-    '  - POST /env/inject-scraper   Inject Scraper Bundle (active_scraper.mjs)\n' +
-    '  - POST /env/inject-replay    Inject Replay Bundle (active_replay.mjs)\n' +
-    '  - POST /env/inject-csv       Inject Watchlist CSV (?filename=PK.csv)\n' +
-    '  - POST /api/scrape/start     Start Candle Scrape (?preset=PK.csv)\n' +
-    '  - POST /api/scrape/stop      Stop Active Candle Scrape\n' +
-    '  - GET  /api/scrape/status    Real-time Scrape Status & Tail Logs\n' +
-    '  - GET  /api/files            List Parquet & SQLite Archives\n' +
-    '  - GET  /api/download/:file   Download Archive\n' +
-    '  - POST /api/parquet          Convert SQLite to ZSTD Parquet (?date=YYYY-MM-DD)\n' +
-    '  - GET  /api/replay/*         Replay Subsystem Endpoints\n' +
-    '  - POST /env/restart-shell    Reset Subsystems (?target=trader|scraper|replay|all)\n');
+  res.writeHead(urlObj.pathname === '/healthz' ? 200 : 503, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'BOOTSTRAP_STANDBY', message: 'Awaiting shell-core via POST /env/inject-shell' }));
 });
 
-// WebSocket Upgrade Delegation
 server.on('upgrade', (req, socket, head) => {
-  if (activeTrader && typeof activeTrader.handleUpgrade === 'function') {
-    return activeTrader.handleUpgrade(req, socket, head);
+  if (activeCore && typeof activeCore.handleUpgrade === 'function') {
+    return activeCore.handleUpgrade(req, socket, head);
   }
   socket.destroy();
 });
 
-// Server Initialization
 let retryCount = 0;
-async function onListening() {
-  console.log(`[TRI-SHELL] Standby receiver listening on port ${PORT}`);
-
-  // Auto-restore Trader bundle from disk
-  if (fs.existsSync(TRADER_BUNDLE)) {
-    await loadTraderModule();
-  }
-
-  // Detect Scraper bundle
-  if (fs.existsSync(SCRAPER_BUNDLE)) {
-    activeScraper = true;
-    console.log(`[TRI-SHELL] Found active scraper bundle (${SCRAPER_BUNDLE}).`);
-  }
-
-  // Auto-restore Replay bundle from disk
-  if (fs.existsSync(REPLAY_BUNDLE)) {
-    await loadReplayModule();
-  }
-
-  startKeepAliveLoop();
-}
-
 server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    if (retryCount < 10) {
-      retryCount++;
-      console.log(`[DUAL-SHELL] Port ${PORT} busy (TIME_WAIT). Retrying bind in 1s (${retryCount}/10)...`);
-      setTimeout(() => {
-        try { server.close(); } catch (_) {}
-        server.listen(PORT, '0.0.0.0', onListening);
-      }, 1000);
-      return;
-    }
-    console.error(`[DUAL-SHELL ERROR] Port ${PORT} is already in use by another process.`);
-  } else {
-    console.error('[DUAL-SHELL ERROR]', err.message);
+  if (err.code === 'EADDRINUSE' && retryCount++ < 10) {
+    return setTimeout(() => { try { server.close(); } catch (_) {} server.listen(PORT, '0.0.0.0'); }, 1000);
   }
+  console.error('[BOOTSTRAP ERROR]', err.message);
 });
 
-server.listen(PORT, '0.0.0.0', onListening);
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`[BOOTSTRAP] Listening on port ${PORT}`);
+  await loadCoreModule();
+  if (process.env.KEEP_ALIVE !== 'false') {
+    const ext = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
+    const targets = [...(ext ? [`${ext.replace(/\/+$/, '')}/healthz`] : []), `http://127.0.0.1:${PORT}/healthz`];
+    const ping = () => targets.forEach(t => fetch(t, { signal: AbortSignal.timeout(6000) }).catch(() => {}));
+    setTimeout(ping, 3000);
+    setInterval(ping, 5 * 60 * 1000);
+  }
+});
